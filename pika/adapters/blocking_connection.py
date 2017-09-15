@@ -95,7 +95,7 @@ class _CallbackResult(object):
         self._ready = True
 
     def set_value_once(self, *args, **kwargs):
-        """ Set as ready with value; the value may be retrived via the `value`
+        """ Set as ready with value; the value may be retrieved via the `value`
         property getter
 
         :raises AssertionError: if result was already set
@@ -696,17 +696,18 @@ class BlockingConnection(object):
             seconds. The actual blocking time depends on the granularity of the
             underlying ioloop. Zero means return as soon as possible. None means
             there is no limit on processing time and the function will block
-            until I/O produces actionalable events. Defaults to 0 for backward
+            until I/O produces actionable events. Defaults to 0 for backward
             compatibility. This parameter is NEW in pika 0.10.0.
         """
-        common_terminator = lambda: bool(
-            self._channels_pending_dispatch or self._ready_events)
-
-        if time_limit is None:
-            self._flush_output(common_terminator)
-        else:
-            with _IoloopTimerContext(time_limit, self._impl) as timer:
-                self._flush_output(timer.is_ready, common_terminator)
+        with self._acquire_event_dispatch() as dispatch_acquired:
+            # Check if we can actually process pending events
+            common_terminator = lambda: bool(dispatch_acquired and
+                (self._channels_pending_dispatch or self._ready_events))
+            if time_limit is None:
+                self._flush_output(common_terminator)
+            else:
+                with _IoloopTimerContext(time_limit, self._impl) as timer:
+                    self._flush_output(timer.is_ready, common_terminator)
 
         if self._ready_events:
             self._dispatch_connection_events()
@@ -1076,7 +1077,7 @@ class BlockingChannel(object):
         'BlockingChannel__OnMessageConfirmationReportArgs',
         'method_frame')
 
-    # Parameters for broker-inititated Channel.Close request: reply_code
+    # Parameters for broker-initiated Channel.Close request: reply_code
     # holds the broker's non-zero error code and reply_text holds the
     # corresponding error message text.
     _OnChannelClosedByBrokerArgs = namedtuple(
@@ -1394,14 +1395,14 @@ class BlockingChannel(object):
                 evt.dispatch()
 
 
-    def close(self, reply_code=0, reply_text="Normal Shutdown"):
+    def close(self, reply_code=0, reply_text="Normal shutdown"):
         """Will invoke a clean shutdown of the channel with the AMQP Broker.
 
         :param int reply_code: The reply code to close the channel with
         :param str reply_text: The reply text to close the channel with
 
         """
-        LOGGER.info('Channel.close(%s, %s)', reply_code, reply_text)
+        LOGGER.debug('Channel.close(%s, %s)', reply_code, reply_text)
 
         # Cancel remaining consumers
         self._cancel_all_consumers()
@@ -2044,7 +2045,7 @@ class BlockingChannel(object):
 
         :returns: True if delivery confirmation is not enabled (NEW in pika
             0.10.0); otherwise returns False if the message could not be
-            deliveved (Basic.nack and/or Basic.Return) and True if the message
+            delivered (Basic.nack and/or Basic.Return) and True if the message
             was delivered (Basic.ack and no Basic.Return)
         """
         try:

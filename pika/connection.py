@@ -183,7 +183,7 @@ class Parameters(object):  # pylint: disable=R0902
     @property
     def backpressure_detection(self):
         """
-        :returns: boolean indicatating whether backpressure detection is
+        :returns: boolean indicating whether backpressure detection is
             enabled. Defaults to `DEFAULT_BACKPRESSURE_DETECTION`.
 
         """
@@ -192,7 +192,7 @@ class Parameters(object):  # pylint: disable=R0902
     @backpressure_detection.setter
     def backpressure_detection(self, value):
         """
-        :param bool value: boolean indicatating whether to enable backpressure
+        :param bool value: boolean indicating whether to enable backpressure
             detection
 
         """
@@ -428,9 +428,10 @@ class Parameters(object):  # pylint: disable=R0902
         :param int value: port number of broker's listening socket
 
         """
-        if not isinstance(value, numbers.Integral):
+        try:
+            self._port = int(value)
+        except (TypeError, ValueError):
             raise TypeError('port must be an int, but got %r' % (value,))
-        self._port = value
 
     @property
     def retry_delay(self):
@@ -468,7 +469,7 @@ class Parameters(object):  # pylint: disable=R0902
         """
         :param float value: socket timeout value; NOTE: this is mostly unused
            now, owing to switchover to to non-blocking socket setting after
-           initial socket conection establishment.
+           initial socket connection establishment.
 
         """
         if value is not None:
@@ -603,7 +604,7 @@ class ConnectionParameters(Parameters):
             `reason_code` of `InternalCloseReasons.BLOCKED_CONNECTION_TIMEOUT`.
         :type blocked_connection_timeout: None, int, float
         :param client_properties: None or dict of client properties used to
-            override the fields in the default client poperties reported to
+            override the fields in the default client properties reported to
             RabbitMQ via `Connection.StartOk` method.
         :param heartbeat_interval: DEPRECATED; use `heartbeat` instead, and
             don't pass both
@@ -699,7 +700,7 @@ class URLParameters(Parameters):
             Override the default maximum channel count value
         - client_properties:
             dict of client properties used to override the fields in the default
-            client poperties reported to RabbitMQ via `Connection.StartOk`
+            client properties reported to RabbitMQ via `Connection.StartOk`
             method
         - connection_attempts:
             Specify how many times pika should try and reconnect before it gives up
@@ -752,7 +753,7 @@ class URLParameters(Parameters):
         # Fix up scheme amqp(s) to http(s) so urlparse won't barf on python
         # prior to 2.7. On Python 2.6.9,
         # `urlparse('amqp://127.0.0.1/%2f?socket_timeout=1')` produces an
-        # incorect path='/%2f?socket_timeout=1'
+        # incorrect path='/%2f?socket_timeout=1'
         if url[0:4].lower() == 'amqp':
             url = 'http' + url[4:]
 
@@ -778,8 +779,8 @@ class URLParameters(Parameters):
             self.port = self.DEFAULT_SSL_PORT if self.ssl else self.DEFAULT_PORT
 
         if parts.username is not None:
-            self.credentials = pika_credentials.PlainCredentials(parts.username,
-                                                                 parts.password)
+            self.credentials = pika_credentials.PlainCredentials(url_unquote(parts.username),
+                                                                 url_unquote(parts.password))
 
         # Get the Virtual Host
         if len(parts.path) > 1:
@@ -970,6 +971,9 @@ class Connection(object):
         """
         self.connection_state = self.CONNECTION_CLOSED
 
+        # Holds timer when the initial connect or reconnect is scheduled
+        self._connection_attempt_timer = None
+
         # Used to hold timer if configured for Connection.Blocked timeout
         self._blocked_conn_timer = None
 
@@ -992,6 +996,7 @@ class Connection(object):
         self._frame_buffer = None
         self._channels = None
         self._backpressure_multiplier = None
+        self.remaining_connection_attempts = None
 
         self._init_connection_state()
 
@@ -1159,35 +1164,22 @@ class Connection(object):
         Connection object should connect on its own.
 
         """
+        assert self._connection_attempt_timer is None, (
+            'connect timer was already scheduled')
+
+        assert self.is_closed, (
+            'connect expected CLOSED state, but got: {}'.format(
+                self._STATE_NAMES[self.connection_state]))
+
         self._set_connection_state(self.CONNECTION_INIT)
 
-        error = self._adapter_connect()
-        if not error:
-            return self._on_connected()
-        self.remaining_connection_attempts -= 1
-        LOGGER.warning('Could not connect, %i attempts left',
-                       self.remaining_connection_attempts)
-        if self.remaining_connection_attempts > 0:
-            LOGGER.info('Retrying in %i seconds', self.params.retry_delay)
-            # TODO remove timeout if connection is closed before timer fires
-            self.add_timeout(self.params.retry_delay, self.connect)
-        else:
-            # TODO connect must not call failure callback from constructor. The
-            # current behavior is error-prone, because the user code may get a
-            # callback upon socket connection failure before user's other state
-            # may be sufficiently initialized. Constructors must either succeed
-            # or raise an exception. To be forward-compatible with failure
-            # reporting from fully non-blocking connection establishment,
-            # connect() should set INIT state and schedule a 0-second timer to
-            # continue the rest of the logic in a private method. The private
-            # method should use itself instead of connect() as the callback for
-            # scheduling retries.
+        # Schedule a timer callback to start the actual connection logic from
+        # event loop's context, thus avoiding error callbacks in the context of
+        # the caller, which could be the constructor.
+        self._connection_attempt_timer = self.add_timeout(
+            0,
+            self._on_connect_timer)
 
-            # TODO This should use _on_terminate for consistent behavior
-            self.callbacks.process(0, self.ON_CONNECTION_ERROR, self, self,
-                                   error)
-            self.remaining_connection_attempts = self.params.connection_attempts
-            self._set_connection_state(self.CONNECTION_CLOSED)
 
     def remove_timeout(self, timeout_id):
         """Adapters should override: Remove a timeout
@@ -1573,6 +1565,11 @@ class Connection(object):
         # simply closed the TCP/IP stream.
         self.callbacks.add(0, spec.Connection.Close, self._on_connection_close)
 
+        if self._connection_attempt_timer is not None:
+            # Connection attempt timer was active when teardown was initiated
+            self.remove_timeout(self._connection_attempt_timer)
+            self._connection_attempt_timer = None
+
         if self.params.blocked_connection_timeout is not None:
             if self._blocked_conn_timer is not None:
                 # Blocked connection timer was active when teardown was
@@ -1781,6 +1778,41 @@ class Connection(object):
         self._add_connection_tune_callback()
         self._send_connection_start_ok(*self._get_credentials(method_frame))
 
+    def _on_connect_timer(self):
+        """Callback for self._connection_attempt_timer: initiate connection
+        attempt in the context of the event loop
+
+        """
+        self._connection_attempt_timer = None
+
+        error = self._adapter_connect()
+        if not error:
+            return self._on_connected()
+        self.remaining_connection_attempts -= 1
+        LOGGER.warning('Could not connect, %i attempts left',
+                       self.remaining_connection_attempts)
+        if self.remaining_connection_attempts > 0:
+            LOGGER.info('Retrying in %i seconds', self.params.retry_delay)
+            self._connection_attempt_timer = self.add_timeout(
+                self.params.retry_delay,
+                self._on_connect_timer)
+        else:
+            # TODO connect must not call failure callback from constructor. The
+            # current behavior is error-prone, because the user code may get a
+            # callback upon socket connection failure before user's other state
+            # may be sufficiently initialized. Constructors must either succeed
+            # or raise an exception. To be forward-compatible with failure
+            # reporting from fully non-blocking connection establishment,
+            # connect() should set INIT state and schedule a 0-second timer to
+            # continue the rest of the logic in a private method. The private
+            # method should use itself instead of connect() as the callback for
+            # scheduling retries.
+
+            # TODO This should use _on_terminate for consistent behavior/cleanup
+            self.callbacks.process(0, self.ON_CONNECTION_ERROR, self, self,
+                                   error)
+            self.remaining_connection_attempts = self.params.connection_attempts
+            self._set_connection_state(self.CONNECTION_CLOSED)
 
     @staticmethod
     def _tune_heartbeat_timeout(client_value, server_value):
@@ -2165,6 +2197,7 @@ class Connection(object):
 
         self.outbound_buffer += write_buffer
         self.frames_sent += len(write_buffer)
+        self.bytes_sent += sum(len(frame) for frame in write_buffer)
         self._flush_outbound()
         if self.params.backpressure_detection:
             self._detect_backpressure()

@@ -376,44 +376,23 @@ class ConnectionTests(unittest.TestCase):  # pylint: disable=R0904
         with self.assertRaises(exceptions.ConnectionClosed):
             self.connection.channel(lambda *args: None)
 
-    @mock.patch('pika.frame.ProtocolHeader')
-    def test_connect(self, frame_protocol_header):
-        """make sure the connect method sets the state and sends a frame"""
-        self.connection._adapter_connect = mock.Mock(return_value=None)
-        self.connection._send_frame = mock.Mock()
-        frame_protocol_header.spec = frame.ProtocolHeader
-        frame_protocol_header.return_value = 'frame object'
-        self.connection.connect()
-        self.assertEqual(self.connection.CONNECTION_PROTOCOL,
-                         self.connection.connection_state)
-        self.connection._send_frame.assert_called_once_with('frame object')
+    def test_connect_no_adapter_connect_from_constructor(self):
+        """check that adapter connection with AMQP is not happening in constructor """
+        with mock.patch('pika.connection.Connection._adapter_connect',
+                        return_value=Exception('_adapter_connect failed')
+                        ) as adapter_connect_mock:
+            with mock.patch('pika.connection.Connection.add_timeout',
+                            return_value='timer') as add_timeout_mock:
+                conn = connection.Connection()
 
-    def test_connect_reconnect(self):
-        """try the different reconnect logic, check state & other class vars"""
-        self.connection._adapter_connect = mock.Mock(return_value='error')
-        self.connection.callbacks = mock.Mock(spec=self.connection.callbacks)
-        self.connection.remaining_connection_attempts = 2
-        self.connection.params.retry_delay = 555
-        self.connection.params.connection_attempts = 99
-        self.connection.add_timeout = mock.Mock()
-        #first failure
-        self.connection.connect()
-        self.connection.add_timeout.assert_called_once_with(
-            555, self.connection.connect)
-        self.assertEqual(1, self.connection.remaining_connection_attempts)
-        self.assertFalse(self.connection.callbacks.process.called)
-        self.assertEqual(self.connection.CONNECTION_INIT,
-                         self.connection.connection_state)
-        #fail with no attempts remaining
-        self.connection.add_timeout.reset_mock()
-        self.connection.connect()
-        self.assertFalse(self.connection.add_timeout.called)
-        self.assertEqual(99, self.connection.remaining_connection_attempts)
-        self.connection.callbacks.process.assert_called_once_with(
-            0, self.connection.ON_CONNECTION_ERROR, self.connection,
-            self.connection, 'error')
-        self.assertEqual(self.connection.CONNECTION_CLOSED,
-                         self.connection.connection_state)
+                self.assertFalse(adapter_connect_mock.called)
+
+                self.assertEqual(conn.connection_state, conn.CONNECTION_INIT)
+
+                self.assertIsNotNone(conn._connection_attempt_timer)
+
+                add_timeout_mock.assert_called_once_with(0,
+                                                         conn._on_connect_timer)
 
     def test_client_properties(self):
         """make sure client properties has some important keys"""
@@ -503,6 +482,47 @@ class ConnectionTests(unittest.TestCase):  # pylint: disable=R0904
         self.connection.connection_state = self.connection.CONNECTION_CLOSED
         with self.assertRaises(AssertionError):
             self.connection._close_channels(200, 'reply text')
+
+    @mock.patch('pika.frame.ProtocolHeader')
+    def test_on_connect_timer(self, frame_protocol_header):
+        """make sure the connect method sets the state and sends a frame"""
+        self.connection.connection_state = self.connection.CONNECTION_INIT
+        self.connection._adapter_connect = mock.Mock(return_value=None)
+        self.connection._send_frame = mock.Mock()
+        frame_protocol_header.spec = frame.ProtocolHeader
+        frame_protocol_header.return_value = 'frame object'
+        self.connection._on_connect_timer()
+        self.assertEqual(self.connection.CONNECTION_PROTOCOL,
+                         self.connection.connection_state)
+        self.connection._send_frame.assert_called_once_with('frame object')
+
+    def test_on_connect_timer_reconnect(self):
+        """try the different reconnect logic, check state & other class vars"""
+        self.connection.connection_state = self.connection.CONNECTION_INIT
+        self.connection._adapter_connect = mock.Mock(return_value='error')
+        self.connection.callbacks = mock.Mock(spec=self.connection.callbacks)
+        self.connection.remaining_connection_attempts = 2
+        self.connection.params.retry_delay = 555
+        self.connection.params.connection_attempts = 99
+        self.connection.add_timeout = mock.Mock()
+        #first failure
+        self.connection._on_connect_timer()
+        self.connection.add_timeout.assert_called_once_with(
+            555, self.connection._on_connect_timer)
+        self.assertEqual(1, self.connection.remaining_connection_attempts)
+        self.assertFalse(self.connection.callbacks.process.called)
+        self.assertEqual(self.connection.CONNECTION_INIT,
+                         self.connection.connection_state)
+        #fail with no attempts remaining
+        self.connection.add_timeout.reset_mock()
+        self.connection._on_connect_timer()
+        self.assertFalse(self.connection.add_timeout.called)
+        self.assertEqual(99, self.connection.remaining_connection_attempts)
+        self.connection.callbacks.process.assert_called_once_with(
+            0, self.connection.ON_CONNECTION_ERROR, self.connection,
+            self.connection, 'error')
+        self.assertEqual(self.connection.CONNECTION_CLOSED,
+                         self.connection.connection_state)
 
     def test_on_connection_start(self):
         """make sure starting a connection sets the correct class vars"""
@@ -704,7 +724,7 @@ class ConnectionTests(unittest.TestCase):  # pylint: disable=R0904
     @mock.patch.object(connection.Connection, 'add_timeout')
     @mock.patch.object(connection.Connection, 'connect',
                        spec_set=connection.Connection.connect)
-    def test_multi_connection_blocked_in_a_row_sets_timer_once(
+    def test_blocked_connection_multiple_blocked_in_a_row_sets_timer_once(
             self,
             connect_mock,
             add_timeout_mock):
@@ -765,7 +785,7 @@ class ConnectionTests(unittest.TestCase):  # pylint: disable=R0904
                        spec_set=connection.Connection.add_timeout)
     @mock.patch.object(connection.Connection, 'connect',
                        spec_set=connection.Connection.connect)
-    def test_connection_unblocked_removes_timer(
+    def test_blocked_connection_unblocked_removes_timer(
             self,
             connect_mock,
             add_timeout_mock,
@@ -794,7 +814,7 @@ class ConnectionTests(unittest.TestCase):  # pylint: disable=R0904
                        spec_set=connection.Connection.add_timeout)
     @mock.patch.object(connection.Connection, 'connect',
                        spec_set=connection.Connection.connect)
-    def test_multi_connection_unblocked_in_a_row_removes_timer_once(
+    def test_blocked_connection_multiple_unblocked_in_a_row_removes_timer_once(
             self,
             connect_mock,
             add_timeout_mock,
@@ -834,7 +854,7 @@ class ConnectionTests(unittest.TestCase):  # pylint: disable=R0904
                        spec_set=connection.Connection.connect)
     @mock.patch.object(connection.Connection, '_adapter_disconnect',
                        spec_set=connection.Connection._adapter_disconnect)
-    def test_on_terminate_removes_timer(
+    def test_blocked_connection_on_terminate_removes_timer(
             self,
             adapter_disconnect_mock,
             connect_mock,
@@ -857,3 +877,28 @@ class ConnectionTests(unittest.TestCase):  # pylint: disable=R0904
         # Check
         conn.remove_timeout.assert_called_once_with(timer)
         self.assertIsNone(conn._blocked_conn_timer)
+
+
+    def test_send_message_updates_frames_sent_and_bytes_sent(self):
+        self.connection._flush_outbound = mock.Mock()
+        self.connection._body_max_length = 10000
+        method = spec.Basic.Publish(exchange='my-exchange',
+                                    routing_key='my-route')
+
+        props = spec.BasicProperties()
+        body = b'b' * 1000000
+
+        self.connection._send_message(channel_number=1,
+                                      method=method,
+                                      content=(props, body))
+
+
+        frames_sent = len(self.connection.outbound_buffer)
+        bytes_sent = sum(len(frame)
+                         for frame in self.connection.outbound_buffer)
+
+        self.assertEqual(self.connection.frames_sent, frames_sent)
+        self.assertEqual(self.connection.bytes_sent, bytes_sent)
+
+        # Make sure _detect_backpressure doesn't throw
+        self.connection._detect_backpressure()

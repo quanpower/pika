@@ -2,7 +2,7 @@ Pika
 ====
 Pika is a RabbitMQ (AMQP-0-9-1) client library for Python.
 
-|Version| |Downloads| |Status| |Coverage| |License| |Docs|
+|Version| |Status| |Coverage| |License| |Docs|
 
 Introduction
 -------------
@@ -23,7 +23,7 @@ extensions.
 
 Documentation
 -------------
-Pika's documentation can be found at `https://pika.readthedocs.org <https://pika.readthedocs.org>`_
+Pika's documentation can be found at `https://pika.readthedocs.io <https://pika.readthedocs.io>`_
 
 Example
 -------
@@ -65,6 +65,7 @@ And an example of writing a blocking consumer:
 Pika provides the following adapters
 ------------------------------------
 
+- AsyncioConnection  - adapter for the Python3 AsyncIO event loop
 - BlockingConnection - enables blocking, synchronous operation on top of library for simple uses
 - LibevConnection    - adapter for use with the libev event loop http://libev.schmorp.de
 - SelectConnection   - fast asynchronous adapter
@@ -90,12 +91,9 @@ with ``google`` style prior to issuing your pull request.
 .. |Coverage| image:: https://img.shields.io/codecov/c/github/pika/pika.svg?
    :target: https://codecov.io/github/pika/pika?branch=master
 
-.. |Downloads| image:: https://img.shields.io/pypi/dm/pika.svg?
-   :target: https://pypi.python.org/pypi/pika
-
 .. |License| image:: https://img.shields.io/pypi/l/pika.svg?
-   :target: https://pika.readthedocs.org
+   :target: https://pika.readthedocs.io
 
 .. |Docs| image:: https://readthedocs.org/projects/pika/badge/?version=stable
-   :target: https://pika.readthedocs.org
+   :target: https://pika.readthedocs.io
    :alt: Documentation Status
